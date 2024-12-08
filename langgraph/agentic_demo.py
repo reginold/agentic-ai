@@ -67,12 +67,19 @@ class WeatherInfoExtractor:
 
 class JsonFormatter:
     def format(self, json_data):
-        parsed_json = json.loads(json_data.replace("'", '"'))
-        formatted_json = json.dumps(parsed_json, indent=4)
-        colorful_json = highlight(formatted_json,
-                          lexers.JsonLexer(),
-                          formatters.TerminalFormatter())
-        return colorful_json
+        try:
+            parsed_json = json.loads(json_data.replace("'", '"'))
+            formatted_json = json.dumps(parsed_json, indent=4)
+            colorful_json = highlight(formatted_json,
+                            lexers.JsonLexer(),
+                            formatters.TerminalFormatter())
+            return colorful_json
+        except json.JSONDecodeError as e:
+            print(f"Failed to decode JSON: {e}")
+            return None
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            return None
 
 
 def main():
