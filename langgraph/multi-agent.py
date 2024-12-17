@@ -35,33 +35,32 @@ tavily_tool = TavilySearchResults(max_results=5)
 repl = PythonREPL()
 
 @tool
-def python_repl_tool(code: Annotated[str, "Python code to execute for generating a chart."]):
-    """
-    Executes Python code in a REPL environment. 
-    Checks if 'output.png' is created after execution.
-    """
+def python_repl_tool(
+    code: Annotated[str, "The python code to execute to generate your chart."],
+):
+    """Use this to execute python code. If you want to see the output of a value,
+    you should print it out with `print(...)`. This is visible to the user."""
     try:
-        print(f"Executing code:\n{code}")
         result = repl.run(code)
-        if "plt.savefig" in code:  # Ensure code contains the savefig call
-            import os
-            if os.path.exists("output.png"):
-                return f"Execution succeeded and chart saved as 'output.png':\n{result}"
-            else:
-                return f"Execution succeeded but 'output.png' was not created. Result:\n{result}"
-        return f"Execution succeeded:\n{result}"
-    except Exception as e:
-        return f"Execution failed. Error: {repr(e)}"
+    except BaseException as e:
+        return f"Failed to execute. Error: {repr(e)}"
+    result_str = f"Successfully executed:\n```python\n{code}\n```\nStdout: {result}"
+    return (
+        result_str + "\n\nIf you have completed all tasks, respond with FINAL ANSWER."
+    )
 
 
 
 # Helper Functions
 def make_system_prompt(suffix: str) -> str:
     return (
-        "You are a helpful AI assistant, collaborating with other assistants. "
-        "Use the provided tools to make progress. If you cannot complete the task, "
-        "leave it for another assistant. Prefix 'FINAL ANSWER' if the task is complete. "
-        f"{suffix}"
+        "You are a helpful AI assistant, collaborating with other assistants."
+        " Use the provided tools to progress towards answering the question."
+        " If you are unable to fully answer, that's OK, another assistant with different tools "
+        " will help where you left off. Execute what you can to make progress."
+        " If you or any of the other assistants have the final answer or deliverable,"
+        " prefix your response with FINAL ANSWER so the team knows to stop."
+        f"\n{suffix}"
     )
 
 def get_next_node(last_message: BaseMessage, goto: str):
@@ -70,61 +69,129 @@ def get_next_node(last_message: BaseMessage, goto: str):
     return goto
 
 # Agents
-llm = ChatOpenAI(model="Meta-Llama-3.1-8B-Instruct")
+llm = ChatOpenAI(model="Meta-Llama-3.1-405B-Instruct")
 
+
+def get_next_node(last_message: BaseMessage, goto: str):
+    if "FINAL ANSWER" in last_message.content:
+        # Any agent decided the work is done
+        return END
+    return goto
+
+
+# Research agent and node
 research_agent = create_react_agent(
     llm,
     tools=[tavily_tool],
-    state_modifier=make_system_prompt("You can only perform research."),
-)
-
-chart_agent = create_react_agent(
-    llm,
-    tools=[python_repl_tool],
     state_modifier=make_system_prompt(
-        "You can only generate charts using Python. Generate Python code that uses matplotlib "
-        "to create a chart and saves it as 'output.png'. Include all necessary imports."
+        "You can only perform research and output results as JSON. "
+        "Do not include any explanations or additional text. "
+        "Provide the data in the following format: "
+        '{"data": [{"year": 2018, "gdp": 2.13}, {"year": 2019, "gdp": 2.17}, {"year": 2020, "gdp": 2.06}, {"year": 2021, "gdp": 8.67}, {"year": 2022, "gdp": 4.35}]}'
     ),
 )
 
 
-# Nodes
+import re
+import json
+
+def extract_json(text: str) -> str:
+    """
+    Extract the first valid JSON object from a given text.
+    Handles cases where the model outputs non-JSON text along with JSON.
+    """
+    json_pattern = r'(\{.*\})'  # Match JSON starting with '{' and ending with '}'
+    matches = re.findall(json_pattern, text, re.DOTALL)
+    if matches:
+        return matches[0]  # Return the first matched JSON block
+    return "{}"  # Return empty JSON if no match is found
+
 def research_node(state: MessagesState) -> Command[Literal["chart_generator", END]]:
     result = research_agent.invoke(state)
-    last_message = result["messages"][-1]
-    print(f"Research Agent Result: {last_message.content}")
-    goto = get_next_node(last_message, "chart_generator")
-    result["messages"][-1] = HumanMessage(content=last_message.content, name="researcher")
-    return Command(update={"messages": result["messages"]}, goto=goto)
+    goto = get_next_node(result["messages"][-1], "chart_generator")
+    
+    # Extract clean JSON content
+    last_content = result["messages"][-1].content
+    clean_json = extract_json(last_content)
+
+    # Validate JSON and handle different structures
+    try:
+        json_output = json.loads(clean_json)
+
+        # Check if 'data' exists; otherwise, assume the JSON is the data itself
+        if "data" in json_output:
+            data = json_output["data"]
+        else:
+            # Assume json_output is directly the data
+            data = json_output
+
+        # Wrap the extracted data into Python code for the REPL tool
+        wrapped_output = {
+            "name": "python_repl_tool",
+            "parameters": {"code": f"data = {json.dumps(data)}\nprint(data)"}
+        }
+    except json.JSONDecodeError:
+        wrapped_output = {"error": "Invalid JSON format extracted from model output"}
+
+    # Update the message with the wrapped function call
+    result["messages"][-1] = HumanMessage(
+        content=json.dumps(wrapped_output), name="researcher"
+    )
+
+    return Command(
+        update={"messages": result["messages"]},
+        goto=goto,
+    )
+
+
+# Chart generator agent and node
+# NOTE: THIS PERFORMS ARBITRARY CODE EXECUTION, WHICH CAN BE UNSAFE WHEN NOT SANDBOXED
+chart_agent = create_react_agent(
+    llm,
+    [python_repl_tool],
+    state_modifier=make_system_prompt(
+        "You can only generate charts. You are working with a researcher colleague."
+    ),
+)
 
 def chart_node(state: MessagesState) -> Command[Literal["researcher", END]]:
     result = chart_agent.invoke(state)
-    last_message = result["messages"][-1]
-    print(f"Chart Agent Result: {last_message.content}")
-    goto = get_next_node(last_message, "researcher")
-    result["messages"][-1] = HumanMessage(content=last_message.content, name="chart_generator")
-    return Command(update={"messages": result["messages"]}, goto=goto)
+    goto = get_next_node(result["messages"][-1], "researcher")
+    # wrap in a human message, as not all providers allow
+    # AI message at the last position of the input messages list
+    result["messages"][-1] = HumanMessage(
+        content=result["messages"][-1].content, name="chart_generator"
+    )
+    
+    return Command(
+        update={
+            # share internal message history of chart agent with other agents
+            "messages": result["messages"],
+        },
+        goto=goto,
+    )
 
 # Graph Workflow
 workflow = StateGraph(MessagesState)
 workflow.add_node("researcher", research_node)
 workflow.add_node("chart_generator", chart_node)
+
 workflow.add_edge(START, "researcher")
 graph = workflow.compile()
 
-# Invocation
 events = graph.stream(
     {
         "messages": [
-            {
-                "role": "user",
-                "content": "Get the UK's GDP over the past 5 years and create a line chart of it.",
-            }
-        ]
+            (
+                "user",
+                "First, get the UK's GDP over the past 5 years, then make a line chart of it. "
+                "Once you make the chart, finish.",
+            )
+        ],
     },
+    # Maximum number of steps to take in the graph
     {"recursion_limit": 150},
 )
-
-for event in events:
-    print(event)
+for s in events:
+    print(s)
     print("----")
